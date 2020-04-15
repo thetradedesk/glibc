@@ -190,6 +190,49 @@ __condvar_cleanup_waiting (void *arg)
   __pthread_mutex_cond_lock (cbuffer->mutex);
 }
 
+/* undo the mistake of potentially stealing might introduce another problem,
+   if we are not stealing in the first place: g_refs[g1] will be 1 less then
+   g_size[g1]. To fix that we wake up every waiter in G1. */
+static void
+__condvar_broadcast_g1 (pthread_cond_t *cond, uint64_t g1_start, int private)
+{
+  unsigned int wrefs = atomic_load_relaxed (&cond->__data.__wrefs);
+  if (wrefs >> 3 == 0)
+    return;
+
+  __condvar_acquire_lock (cond, private);
+
+  /* if a different g1_start is observed after acquiring the lock,
+     do nothing */
+  if (g1_start != __condvar_load_g1_start_relaxed (cond))
+    goto release_lock;
+
+  unsigned long long int wseq = __condvar_load_wseq_relaxed (cond);
+  unsigned int g1 = (wseq & 1) ^ 1;
+  wseq >>= 1;
+
+  /* Step (1): signal all waiters remaining in G1.  */
+  if (cond->__data.__g_size[g1] != 0)
+    {
+      /* Add as many signals as the remaining size of the group.
+         we might add 1 more than __g_refs[g1], which is fine. */
+      atomic_fetch_add_relaxed (cond->__data.__g_signals + g1,
+                                cond->__data.__g_size[g1] << 1);
+
+      cond->__data.__g_size[g1] = 0;
+
+      /* Wake up all waiters in G1 */
+      futex_wake (cond->__data.__g_signals + g1, INT_MAX, private);
+    }
+
+  /* Step (2) wait until all waiters are awaken, and switch.  */
+  __condvar_quiesce_and_switch_g1 (cond, wseq, &g1, private);
+
+release_lock:
+  __condvar_release_lock (cond, private);
+  return;
+}
+
 /* This condvar implementation guarantees that all calls to signal and
    broadcast and all of the three virtually atomic parts of each call to wait
    (i.e., (1) releasing the mutex and blocking, (2) unblocking, and (3) re-
@@ -608,6 +651,15 @@ __pthread_cond_wait_common (pthread_cond_t *cond, pthread_mutex_t *mutex,
 		     the signal from, which cause it to block using the
 		     futex).  */
 		  futex_wake (cond->__data.__g_signals + g, 1, private);
+
+		  /* We might be wrong about stealing, we got the signal
+		     from the an old g1, but ended up returning it to
+		     a different g1. We can't tell whether it is the case.
+		     If it is, we now caused another issue:
+		     now g_refs[g1] is one less than g_size[g1].
+		     The mitigation step is to broadcast g1, let every
+		     waiter wake up spuriosly. */
+		  __condvar_broadcast_g1(cond, g1_start, private);
 		  break;
 		}
 	      /* TODO Back off.  */
